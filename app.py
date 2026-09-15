@@ -46,7 +46,8 @@ batch_size = st.sidebar.selectbox("Batch Size", options=[16, 32, 64], index=1)
 @st.cache_data(ttl=3600)
 def fetch_data(symbol, start, end):
   try:
-    df = yf.download(symbol, start=start, end=end, progress=False)
+    # Adding auto_adjust=True helps stabilize downloads on cloud IPs
+    df = yf.download(symbol, start=start, end=end, progress=False, auto_adjust=True)
     if df is None or df.empty:
       return None
 
@@ -63,7 +64,6 @@ def fetch_data(symbol, start, end):
     return df
   except Exception:
     return None
-
 
 with st.spinner(f"Fetching market data for {ticker}..."):
   df = fetch_data(ticker, start_date, end_date)
