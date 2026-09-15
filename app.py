@@ -46,17 +46,36 @@ batch_size = st.sidebar.selectbox("Batch Size", options=[16, 32, 64], index=1)
 @st.cache_data(ttl=3600)
 def fetch_data(symbol, start, end):
   try:
-    # Adding auto_adjust=True helps stabilize downloads on cloud IPs
+    # auto_adjust=True stabilizes downloads on cloud IPs
     df = yf.download(symbol, start=start, end=end, progress=False, auto_adjust=True)
     if df is None or df.empty:
       return None
 
+    # yfinance may return MultiIndex columns like ("Close", "GOOG").
+    # Flatten robustly regardless of level names/order.
     if isinstance(df.columns, pd.MultiIndex):
-      df.columns = df.columns.droplevel("Ticker")
+      if "Ticker" in df.columns.names:
+        try:
+          df = df.xs(symbol, level="Ticker", axis=1)
+        except KeyError:
+          df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+      else:
+        df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+    # Also flatten any stray tuple-named columns.
+    df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
 
     df = df.reset_index()
 
     if "Close" not in df.columns:
+      return None
+
+    # Ensure Close is a 1-D numeric series (guards against duplicate cols).
+    close = df["Close"]
+    if isinstance(close, pd.DataFrame):
+      close = close.iloc[:, 0]
+    df["Close"] = pd.to_numeric(close, errors="coerce")
+    df = df.dropna(subset=["Close"])
+    if df.empty:
       return None
 
     df["MA100"] = df["Close"].rolling(100).mean()
@@ -147,20 +166,37 @@ with tab2:
 
 st.subheader("🤖 Dynamic LSTM Prediction Engine")
 
-if st.button(f"Run Prediction Model for {ticker}", type="primary"):
+if "results" not in st.session_state:
+  st.session_state["results"] = {}
+
+run_model = st.button(f"Run Prediction Model for {ticker}", type="primary")
+
+if run_model:
+  # --- 1. Prepare raw series as clean 1-D float vector ---
+  close_raw = df["Close"]
+  if isinstance(close_raw, pd.DataFrame):
+    close_raw = close_raw.iloc[:, 0]
+  close_raw = pd.to_numeric(close_raw, errors="coerce").dropna().values.astype(float).reshape(-1, 1)
+
+  # --- 2. Split BEFORE scaling to avoid data leakage ---
+  # Keep `lookback` overlap so test sequences have full history.
+  split_idx = int(len(close_raw) * 0.8)
+  train_raw = close_raw[:split_idx]
+  test_raw_with_history = close_raw[split_idx - lookback :]
+
   scaler = MinMaxScaler(feature_range=(0, 1))
-  scaled_data = scaler.fit_transform(df[["Close"]].values)
+  train_scaled = scaler.fit_transform(train_raw)
+  test_scaled = scaler.transform(test_raw_with_history)
 
-  X, y = [], []
-  for i in range(lookback, len(scaled_data)):
-    X.append(scaled_data[i - lookback : i, 0])
-    y.append(scaled_data[i, 0])
+  def make_sequences(data, window):
+    Xs, ys = [], []
+    for i in range(window, len(data)):
+      Xs.append(data[i - window : i, 0])
+      ys.append(data[i, 0])
+    return np.array(Xs), np.array(ys)
 
-  X, y = np.array(X), np.array(y)
-
-  split = int(len(X) * 0.8)
-  xtrn, ytrn = X[:split], y[:split]
-  xtst, ytst = X[split:], y[split:]
+  xtrn, ytrn = make_sequences(train_scaled, lookback)
+  xtst, ytst = make_sequences(test_scaled, lookback)
 
   xtrn = xtrn.reshape((xtrn.shape[0], xtrn.shape[1], 1))
   xtst = xtst.reshape((xtst.shape[0], xtst.shape[1], 1))
@@ -194,31 +230,64 @@ if st.button(f"Run Prediction Model for {ticker}", type="primary"):
         verbose=0,
     )
 
-  st.success("Training complete!")
-
-  y_pred_scaled = model.predict(xtst)
-  y_pred = scaler.inverse_transform(y_pred_scaled)
-  ytst_actual = scaler.inverse_transform(ytst.reshape(-1, 1))
+  y_pred_scaled = model.predict(xtst, verbose=0)
+  y_pred = scaler.inverse_transform(y_pred_scaled).flatten()
+  ytst_actual = scaler.inverse_transform(ytst.reshape(-1, 1)).flatten()
 
   mae = mean_absolute_error(ytst_actual, y_pred)
-  rmse = np.sqrt(mean_squared_error(ytst_actual, y_pred))
-  r2 = r2_score(ytst_actual, y_pred)
+  rmse = float(np.sqrt(mean_squared_error(ytst_actual, y_pred)))
+  r2 = r2_score(ytst_actual, y_pred) if len(ytst_actual) > 1 else float("nan")
 
-  actual_dir = np.sign(np.diff(ytst_actual.flatten()))
-  pred_dir = np.sign(np.diff(y_pred.flatten()))
-  dir_accuracy = np.mean(actual_dir == pred_dir) * 100
+  if len(ytst_actual) > 1:
+    actual_dir = np.sign(np.diff(ytst_actual))
+    pred_dir = np.sign(np.diff(y_pred))
+    # Ignore flat (0-change) steps so 0 vs 0 doesn't inflate/deflate score.
+    mask = (actual_dir != 0) & (pred_dir != 0)
+    dir_accuracy = float(np.mean(actual_dir[mask] == pred_dir[mask]) * 100) if mask.any() else 0.0
+  else:
+    dir_accuracy = 0.0
 
+  # Next-session forecast from the most recent (scaled with train-fit scaler) window.
+  last_window_raw = close_raw[-lookback:].reshape(-1, 1)
+  last_window = scaler.transform(last_window_raw).reshape(1, lookback, 1)
+  next_scaled = model.predict(last_window, verbose=0)
+  next_price = float(scaler.inverse_transform(next_scaled)[0][0])
+
+  last_close = float(close_raw[-1][0])
+  change = next_price - last_close
+  pct_change = (change / last_close) * 100 if last_close != 0 else 0.0
+
+  st.session_state["results"][ticker] = {
+      "mae": float(mae),
+      "rmse": float(rmse),
+      "r2": float(r2),
+      "dir_accuracy": float(dir_accuracy),
+      "y_pred": y_pred.tolist(),
+      "y_actual": ytst_actual.tolist(),
+      "next_price": float(next_price),
+      "last_close": float(last_close),
+      "change": float(change),
+      "pct_change": float(pct_change),
+      "lookback": int(lookback),
+      "epochs": int(epochs),
+      "batch_size": int(batch_size),
+  }
+  st.success("Training complete!")
+
+# --- 3. Render persisted results (survives Streamlit re-runs) ---
+res = st.session_state["results"].get(ticker)
+if res is not None:
   col1, col2, col3, col4 = st.columns(4)
-  col1.metric("MAE", f"${mae:.2f}")
-  col2.metric("RMSE", f"${rmse:.2f}")
-  col3.metric("R² Score", f"{r2:.4f}")
-  col4.metric("Directional Accuracy", f"{dir_accuracy:.2f}%")
+  col1.metric("MAE", f"${res['mae']:.2f}")
+  col2.metric("RMSE", f"${res['rmse']:.2f}")
+  col3.metric("R² Score", f"{res['r2']:.4f}")
+  col4.metric("Directional Accuracy", f"{res['dir_accuracy']:.2f}%")
 
   st.write("#### Test Set Evaluation: Actual vs Predicted")
   fig_eval = go.Figure()
   fig_eval.add_trace(
       go.Scatter(
-          y=ytst_actual.flatten(),
+          y=res["y_actual"],
           mode="lines",
           name="Actual Price",
           line=dict(color="#94A3B8", width=1.5),
@@ -226,7 +295,7 @@ if st.button(f"Run Prediction Model for {ticker}", type="primary"):
   )
   fig_eval.add_trace(
       go.Scatter(
-          y=y_pred.flatten(),
+          y=res["y_pred"],
           mode="lines",
           name="Predicted Price",
           line=dict(color="#EF4444", width=1.5, dash="dash"),
@@ -240,17 +309,9 @@ if st.button(f"Run Prediction Model for {ticker}", type="primary"):
   )
   st.plotly_chart(fig_eval, use_container_width=True)
 
-  last_window = scaled_data[-lookback:].reshape(1, lookback, 1)
-  next_scaled = model.predict(last_window)
-  next_price = scaler.inverse_transform(next_scaled)[0][0]
-
-  last_close = df["Close"].iloc[-1]
-  change = next_price - last_close
-  pct_change = (change / last_close) * 100
-
   st.write("#### Next Trading Session Prediction")
   st.metric(
       label=f"Projected Close for {ticker}",
-      value=f"${next_price:.2f}",
-      delta=f"${change:.2f} ({pct_change:.2f}%)",
+      value=f"${res['next_price']:.2f}",
+      delta=f"${res['change']:.2f} ({res['pct_change']:.2f}%)",
   )
